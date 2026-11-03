@@ -47,8 +47,14 @@ export async function attachStatusCallback(conversationId, url) {
 
 // --------------------------------------------------------------------------- Conversation Memory
 
-/** @type {Map<string, string>} cache of "email:x" / "phone:y" -> profile id */
+/**
+ * Short-lived cache of "email:x" / "phone:y" -> profile id (60 s). Short on purpose:
+ * the brain view's "Reset demo" deletes and re-creates Mia's profile, so a long-lived
+ * cache would keep pointing at the deleted one.
+ * @type {Map<string, {id: string, at: number}>}
+ */
 const profileCache = new Map();
+const PROFILE_CACHE_MS = 60 * 1000;
 
 /**
  * Find a Memory profile id by email or phone. Cached, because the opening line,
@@ -63,12 +69,13 @@ export async function lookupProfileId(tac, { email, phone } = {}) {
   const [idType, value] = email ? ['email', email] : ['phone', phone];
   if (!value) return null;
   const key = `${idType}:${value}`;
-  if (profileCache.has(key)) return profileCache.get(key);
+  const cached = profileCache.get(key);
+  if (cached && Date.now() - cached.at < PROFILE_CACHE_MS) return cached.id;
   try {
     const result = await timed(log, 'Memory profile lookup', () => memory.lookupProfile(idType, value), { idType });
     const profileId = result.profiles?.[0] || null;
     if (profileId) {
-      profileCache.set(key, profileId);
+      profileCache.set(key, { id: profileId, at: Date.now() });
       log.info({ idType, profileId }, 'Memory profile found');
     } else {
       log.warn({ idType, value }, 'No Memory profile for this identifier (run `provision seed`?)');
