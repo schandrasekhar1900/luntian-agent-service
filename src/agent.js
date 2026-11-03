@@ -1,5 +1,5 @@
 /**
- * agent.js — "Lia", Luntian Bank's AI agent. One brain for chat and voice.
+ * agent.js — "Pia", Luntian Bank's AI agent. One brain for chat and voice.
  *
  * Flow of one customer turn (called by TAC's onMessageReady):
  *
@@ -45,7 +45,7 @@ function customerRecord() {
 
 // --------------------------------------------------------------------------- prompts
 
-const PERSONA = `You are Lia, the AI assistant of Luntian Bank, a Philippine bank.
+const PERSONA = `You are Pia, the AI assistant of Luntian Bank, a Philippine bank.
 You help personal-banking customers with their loans.
 
 How you work:
@@ -176,7 +176,7 @@ export function calculateRelief({ option, new_term_months, annual_rate, holiday_
 
 // --------------------------------------------------------------------------- the agent
 
-export class Lia {
+export class Pia {
   /** @param {import('twilio-agent-connect').TAC} tac */
   constructor(tac) {
     this.tac = tac;
@@ -190,7 +190,7 @@ export class Lia {
     this.pendingOpeners = new Map();
     this.knowledgeTool = null;
     this.knowledgeClient = tac.getKnowledgeClient() || new KnowledgeClient(tac.getConfig());
-    log.info({ model: settings.anthropicModel, knowledgeBase: settings.knowledgeBaseId || null }, 'Lia initialised');
+    log.info({ model: settings.anthropicModel, knowledgeBase: settings.knowledgeBaseId || null }, 'Pia initialised');
   }
 
   forget(conversationId) {
@@ -214,7 +214,7 @@ export class Lia {
         });
         log.info({ knowledgeBaseId: settings.knowledgeBaseId }, 'Knowledge search tool ready');
       } catch (err) {
-        log.warn({ err: err.message }, 'Knowledge tool unavailable; Lia will answer without policy search');
+        log.warn({ err: err.message }, 'Knowledge tool unavailable; Pia will answer without policy search');
       }
     }
     return this.knowledgeTool;
@@ -335,7 +335,7 @@ export class Lia {
 
     registry.upsert(conversationId, { channel, profileId: session.profileId, callSid: session.callSid, chatSid });
 
-    // First turn of this conversation: fold in Lia's memory-informed opening line.
+    // First turn of this conversation: fold in Pia's memory-informed opening line.
     let history = this.history.get(conversationId);
     if (!history) {
       history = [];
@@ -376,13 +376,17 @@ export class Lia {
     const system = this.systemPrompt(channel, session, memory);
     tlog.debug({ system }, 'System prompt');
     // Claude's Messages API wants the first message from the user. On turn one the
-    // history starts with Lia's opening line, so we prefix a short context note.
+    // history starts with Pia's opening line, so we prefix a short context note.
     const messages = history[0]?.role === 'assistant'
       ? [{ role: 'user', content: `(The customer opened the ${channel === 'VOICE' ? 'call' : 'chat'}.)` }, ...history]
       : [...history];
 
     let reply = '';
     let toolCalls = 0;
+    // Claude often writes its answer in the SAME turn as a tool call ("Got it — here's…" +
+    // save_customer_note) and then ends with an empty turn after the tool result.
+    // Keep that interim text so the customer always gets the real answer.
+    const interimText = [];
     try {
       // Tool-use loop: at most 6 model round trips per customer turn.
       for (let round = 1; round <= 6; round += 1) {
@@ -390,12 +394,17 @@ export class Lia {
         const resp = await claude.messages({ system, messages, tools, maxTokens: channel === 'VOICE' ? 400 : 800, purpose: `turn ${round}` });
         const toolUses = (resp.content || []).filter((b) => b.type === 'tool_use');
         const text = (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
-        tlog.debug({ round, ms: Date.now() - t0, stop: resp.stop_reason, toolUses: toolUses.length, usage: resp.usage }, 'LLM round');
+        tlog.info(
+          { round, ms: Date.now() - t0, stop: resp.stop_reason, toolUses: toolUses.map((t) => t.name), textChars: text.length },
+          'LLM round'
+        );
+        if (resp.stop_reason === 'max_tokens') tlog.warn({ round }, 'Claude hit max_tokens; reply may be cut short');
 
         if (resp.stop_reason !== 'tool_use' || !toolUses.length) {
           reply = text;
           break;
         }
+        if (text) interimText.push(text);
         // Echo Claude's full turn (text + tool_use blocks), then answer every tool_use in one user turn.
         messages.push({ role: 'assistant', content: resp.content });
         const results = [];
@@ -412,6 +421,27 @@ export class Lia {
         }
         messages.push({ role: 'user', content: results });
       }
+
+      // Final turn had no text: use what Claude said alongside its tool calls
+      if (!reply && interimText.length) {
+        reply = interimText.join(' ');
+        tlog.info({ chars: reply.length }, 'Final turn was empty; using the text Claude wrote alongside its tool calls');
+      }
+      // Still nothing: ask once more, explicitly, for the customer-facing reply (no tools)
+      if (!reply) {
+        tlog.warn('No reply text after the tool loop; asking Claude once more for the customer-facing reply');
+        const nudge = [
+          ...messages,
+          ...(messages[messages.length - 1]?.role === 'user' ? [] : [{ role: 'user', content: '(continue)' }]),
+        ];
+        // The last message is a tool_result turn (role user); add the instruction to it as plain text.
+        const last = nudge[nudge.length - 1];
+        const instruction = { type: 'text', text: 'Now reply to the customer in your normal style. Do not call tools.' };
+        nudge[nudge.length - 1] = { role: 'user', content: Array.isArray(last.content) ? [...last.content, instruction] : `${last.content}\n\n${instruction.text}` };
+        const resp = await claude.messages({ system, messages: nudge, maxTokens: channel === 'VOICE' ? 300 : 600, purpose: 'final reply' });
+        reply = (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+        tlog.info({ chars: reply.length, stop: resp.stop_reason }, 'Final reply after nudge');
+      }
     } catch (err) {
       tlog.error({ err: err.message }, 'LLM turn failed');
       bus.emit('error', { message: err.message }, conversationId, channel);
@@ -421,14 +451,14 @@ export class Lia {
     reply ||= 'Sige, one moment po.';
     history.push({ role: 'assistant', content: reply });
     bus.emit('agent_message', { text: reply }, conversationId, channel);
-    tlog.info({ reply, toolCalls, ms: Date.now() - started }, 'Lia replied');
+    tlog.info({ reply, toolCalls, ms: Date.now() - started }, 'Pia replied');
     return reply;
   }
 
   // ------------------------------------------------------------------ informed opening line
 
   /**
-   * Build the first thing Lia says, from Conversation Memory (the "informed start").
+   * Build the first thing Pia says, from Conversation Memory (the "informed start").
    * @param {'CHAT'|'VOICE'} channel
    * @param {string|null} profileId
    * @param {string} key classic chat SID or CallSid, used to link it to the conversation later
@@ -443,8 +473,8 @@ export class Lia {
     if (coldStart) {
       line =
         channel === 'VOICE'
-          ? `Hi ${name}, this is Lia from Luntian Bank. How can I help you today?`
-          : `Hi ${name}! I'm Lia, your Luntian assistant. Kumusta? How can I help you today?`;
+          ? `Hi ${name}, this is Pia from Luntian Bank. How can I help you today?`
+          : `Hi ${name}! I'm Pia, your Luntian assistant. Kumusta? How can I help you today?`;
       tlog.info({ profileId }, 'Opening line: cold start (no memory yet)');
     } else {
       const memoryText = [
@@ -456,10 +486,10 @@ export class Lia {
           ? 'It will be spoken on a phone call: max 35 words, no symbols, amounts in words.'
           : 'It is a web chat message: max 45 words, plain text.';
       const prompt =
-        `You are Lia, Luntian Bank's AI assistant. ${name} is a returning customer who has just opened a ` +
+        `You are Pia, Luntian Bank's AI assistant. ${name} is a returning customer who has just opened a ` +
         `${channel === 'VOICE' ? 'phone call' : 'web chat'}.\n` +
         `What we know (oldest first; later entries supersede earlier ones):\n${memoryText}\n\n` +
-        "Write Lia's opening message. Greet by first name, reflect the CURRENT state of their plans in one specific " +
+        "Write Pia's opening message. Greet by first name, reflect the CURRENT state of their plans in one specific " +
         'sentence (ignore superseded plans), and ask one question that moves things forward. ' +
         `Never mention memory, notes or records. ${style}`;
       tlog.debug({ prompt }, 'Opening line prompt');

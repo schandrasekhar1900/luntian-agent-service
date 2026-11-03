@@ -3,7 +3,7 @@
  *
  *  - Conversation Orchestrator: re-attach a conversation's status callbacks after a
  *    chat handoff, so the Serverless /webhooks/co-events feeds the Flex panel.
- *  - Conversation Memory: profile lookup (cached) and memory snapshots for Lia's
+ *  - Conversation Memory: profile lookup (cached) and memory snapshots for Pia's
  *    voice opening line and the save_customer_note tool.
  *
  * All functions log what they do, and none of them throw into the demo flow:

@@ -75,7 +75,7 @@ export const firstName = settings.customerName.split(/\s+/)[0];
 
 /** Addresses that identify the customer in Orchestrator communications. */
 export const customerAddresses = new Set([settings.customerEmail, settings.customerPhone]);
-/** Addresses that identify Lia (AI) in Orchestrator communications. */
+/** Addresses that identify Pia (AI) in Orchestrator communications. */
 export const aiAddresses = new Set([settings.chatAgentIdentity, settings.agentNumber]);
 
 if (settings.chatAgentIdentity === settings.customerEmail) {

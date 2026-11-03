@@ -1,5 +1,5 @@
 /**
- * server.js — Lia agent service (Node.js + Twilio Agent Connect).
+ * server.js — Pia agent service (Node.js + Twilio Agent Connect).
  *
  * Why this isn't a Twilio Function: ConversationRelay streams the AI voice call over
  * a WebSocket, and TAC keeps per-conversation state between webhooks. Functions
@@ -22,7 +22,7 @@
  */
 
 import { ChatChannel, TAC, TACConfig, TACServer, VoiceChannel } from 'twilio-agent-connect';
-import { Lia } from './agent.js';
+import { Pia } from './agent.js';
 import { baseUrl, settings } from './config.js';
 import { bus, registry } from './events.js';
 import { getLogger } from './logger.js';
@@ -37,9 +37,9 @@ process.on('uncaughtException', (err) => log.fatal({ err: err.message, stack: er
 log.info({ configurationId: settings.conversationConfigurationId }, 'Starting Twilio Agent Connect');
 const tac = await TAC.create({ config: TACConfig.fromEnv() });
 log.info({ orchestrator: tac.isOrchestratorEnabled(), memoryStore: tac.getMemoryStoreId() || null }, 'TAC ready');
-if (!tac.getMemoryStoreId()) log.warn('No memory store linked to the Orchestrator configuration: Lia will have no memory');
+if (!tac.getMemoryStoreId()) log.warn('No memory store linked to the Orchestrator configuration: Pia will have no memory');
 
-const lia = new Lia(tac);
+const lia = new Pia(tac);
 
 /**
  * Chat: customers use the Conversations JS SDK with their EMAIL as identity, which
@@ -54,7 +54,7 @@ const chatChannel = new ChatChannel(tac, { agentAddress: settings.chatAgentIdent
  */
 const voiceChannel = new VoiceChannel(tac, {
   memoryMode: 'once',
-  defaultTwimlOptions: { welcomeGreeting: 'Hi, this is Lia from Luntian Bank. How can I help you today?', interruptible: 'speech' },
+  defaultTwimlOptions: { welcomeGreeting: 'Hi, this is Pia from Luntian Bank. How can I help you today?', interruptible: 'speech' },
 });
 
 /** Every customer turn on any channel. TAC sends the returned text on the right channel. */
