@@ -1,0 +1,21 @@
+{
+  "name": "luntian-agent-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lia, Luntian Bank's AI agent: Twilio Agent Connect (chat + ConversationRelay voice) with Conversation Memory, Enterprise Knowledge and Flex handoff. Publishes live events to Twilio Sync.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0",
+    "twilio": "^5.3.0",
+    "twilio-agent-connect": "2.5.0"
+  }
+}

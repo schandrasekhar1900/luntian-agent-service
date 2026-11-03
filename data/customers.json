@@ -1,0 +1,36 @@
+{
+  "mia.santos@gmail.com": {
+    "name": "Mia Santos",
+    "customerSince": "2019-03-14",
+    "segment": "Personal Banking - Preferred",
+    "branch": "BGC High Street",
+    "loans": [
+      {
+        "type": "AUTO",
+        "accountRef": "AL-****8204",
+        "vehicle": "2023 Toyota Fortuner 2.8 LTD",
+        "originalAmount": 1850000,
+        "outstandingBalance": 1120400,
+        "monthlyAmortization": 36130,
+        "interestRatePa": 8.25,
+        "remainingTermMonths": 35,
+        "status": "Current - no missed payments",
+        "nextDueDate": "2026-11-25"
+      },
+      {
+        "type": "HOME",
+        "accountRef": "HL-****4517",
+        "property": "2BR condominium unit, Mandaluyong City",
+        "originalAmount": 7800000,
+        "outstandingBalance": 6480000,
+        "monthlyAmortization": 50970,
+        "interestRatePa": 6.5,
+        "rateFixedUntil": "2027-06-30",
+        "remainingTermMonths": 216,
+        "monthsInGoodStanding": 54,
+        "status": "Current - no missed payments",
+        "nextDueDate": "2026-11-30"
+      }
+    ]
+  }
+}
