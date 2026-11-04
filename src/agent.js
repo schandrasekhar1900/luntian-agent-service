@@ -122,7 +122,9 @@ const CHANNEL_STYLE = {
   CHAT: 'CHANNEL: web chat. Plain text only (no markdown, no bullets, no headings). At most 3 short paragraphs.',
   VOICE:
     'CHANNEL: phone call. Reply in one or two short spoken sentences. No lists, symbols or markdown. ' +
-    "Say amounts naturally, e.g. 'about twenty-seven thousand pesos a month'. Ask one question at a time.",
+    "Say amounts naturally, e.g. 'about twenty-seven thousand pesos a month'. Ask one question at a time. " +
+    'You have already greeted the caller using CUSTOMER CONTEXT. Keep building on their LATEST plan from earlier chats ' +
+    '(e.g. the payment holiday they chose) instead of asking generic "how can I help" questions.',
 };
 
 /** Tools implemented locally (OpenAI-style schema; converted to Claude's format by toClaudeTool). */
@@ -701,11 +703,19 @@ export class Pia {
       tlog.debug({ prompt }, 'Opening line prompt');
       try {
         const t0 = Date.now();
-        line = await claude.text(prompt, { maxTokens: 1500, timeoutMs: 8000, purpose: 'opening line' });
-        tlog.info({ ms: Date.now() - t0, observations: snap.observations.length, summaries: snap.summaries.length }, 'Opening line generated from memory');
+        // Voice: at most ~6 s so the caller isn't left in silence while the greeting is written
+        line = await claude.text(prompt, { maxTokens: 1500, timeoutMs: channel === 'VOICE' ? 6000 : 8000, purpose: 'opening line' });
+        tlog.info({ ms: Date.now() - t0, chars: (line || '').length, observations: snap.observations.length, summaries: snap.summaries.length }, 'Opening line generated from memory');
       } catch (err) {
         tlog.warn({ err: err.message }, 'Opening line generation failed; using fallback');
-        line = `Welcome back, ${name}! Shall we pick up where we left off?`;
+        line = '';
+      }
+      // Never greet with silence: an empty reply falls back to a line that still shows we remember
+      if (!line) {
+        tlog.warn('Opening line came back empty; using the memory-aware fallback');
+        line = channel === 'VOICE'
+          ? `Hi ${name}, this is Pia from Luntian Bank. I have the notes from our recent chats here, so we can pick up right where we left off. What would you like to go over?`
+          : `Welcome back, ${name}! I have the notes from our recent chats here. Shall we pick up where we left off?`;
       }
     }
 

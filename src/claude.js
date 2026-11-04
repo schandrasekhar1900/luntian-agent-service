@@ -84,13 +84,20 @@ async function messagesOnce({ system, messages: msgs, tools, maxTokens = 1024, t
   }
 }
 
-/** Convenience: single prompt in, plain text out. */
-export async function text(prompt, { maxTokens = 300, timeoutMs = 8000, purpose = 'text' } = {}) {
-  const resp = await messages({ messages: [{ role: 'user', content: prompt }], maxTokens, timeoutMs, purpose });
-  return (resp.content || [])
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text)
-    .join('')
-    .trim()
-    .replace(/^"|"$/g, '');
+/**
+ * Convenience: single prompt in, plain text out. If the model spends its whole allowance
+ * reasoning and returns no text (stop_reason "max_tokens"), retry once with double the room.
+ */
+export async function text(prompt, { maxTokens = 1500, timeoutMs = 8000, purpose = 'text' } = {}) {
+  const started = Date.now();
+  const extract = (resp) => (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim().replace(/^"|"$/g, '');
+  let resp = await messages({ messages: [{ role: 'user', content: prompt }], maxTokens, timeoutMs, purpose });
+  let out = extract(resp);
+  const left = timeoutMs - (Date.now() - started);
+  if (!out && resp.stop_reason === 'max_tokens' && left > 1500) {
+    log.warn({ purpose, maxTokens }, 'Empty reply (ran out of tokens); retrying with more room');
+    resp = await messages({ messages: [{ role: 'user', content: prompt }], maxTokens: maxTokens * 2, timeoutMs: left, purpose: `${purpose} (retry)` });
+    out = extract(resp);
+  }
+  return out;
 }
