@@ -67,6 +67,10 @@ How you work:
   something already known. When observations conflict, the most recent one wins (people change their minds).
 - Use get_customer_accounts for balances and amortizations, calculate_relief_options for any figures,
   and search_luntian_policies for policy, rates, fees, eligibility and disclosures. Never invent numbers or policy.
+- FIGURES RULE: before you state ANY peso amount, monthly payment, saving, interest cost, rate or term for an
+  option, you MUST have called calculate_relief_options (and get_customer_accounts for current balances) in this
+  conversation and quote ONLY the numbers those tools returned. If you have not run them yet, run them first.
+  Never estimate, round from memory or "approximately" calculate in your head.
 - When the customer states something worth remembering for next time (a life event, a preference,
   a decision or change of mind, how they want to be contacted, what they still need to do), call
   save_customer_note with one short third-person sentence, e.g. "Mia now prefers a 3-month home loan
@@ -192,6 +196,8 @@ export class Pia {
   /** @param {import('twilio-agent-connect').TAC} tac */
   constructor(tac) {
     this.tac = tac;
+    /** Conversations where Pia has already run the calculator or account lookup (figures guard) */
+    this.dataToolUsed = new Set();
     /** Audience conversations currently handed to Flex (for the concurrent-handoff cap) */
     this.audienceHandoffs = new Set();
     /** @type {Map<string, Array<object>>} chat history per Orchestrator conversation */
@@ -210,6 +216,7 @@ export class Pia {
   /** Conversation closed: free its handoff slot and per-conversation data. */
   release(conversationId) {
     this.audienceHandoffs.delete(conversationId);
+    this.dataToolUsed.delete(conversationId);
     audienceRecords.delete(conversationId);
   }
 
@@ -459,6 +466,7 @@ export class Pia {
     // save_customer_note) and then ends with an empty turn after the tool result.
     // Keep that interim text so the customer always gets the real answer.
     const interimText = [];
+    let figuresRetried = false;
     try {
       // Tool-use loop: at most 6 model round trips per customer turn.
       for (let round = 1; round <= 6; round += 1) {
@@ -473,6 +481,19 @@ export class Pia {
         if (resp.stop_reason === 'max_tokens') tlog.warn({ round }, 'Claude hit max_tokens; reply may be cut short');
 
         if (resp.stop_reason !== 'tool_use' || !toolUses.length) {
+          // Guard: a reply quoting peso figures before any calculator/accounts call in this conversation
+          // is discarded once, and Claude is told to run the tools and answer again.
+          const quotesFigures = /₱\s?\d|PHP\s?\d|\b\d{1,3}(,\d{3})+\b/.test(text);
+          if (quotesFigures && !this.dataToolUsed.has(conversationId) && !figuresRetried && round < 6) {
+            figuresRetried = true;
+            tlog.warn({ round }, 'Reply quoted figures without running the calculator; asking Claude to calculate first');
+            messages.push({ role: 'assistant', content: text });
+            messages.push({
+              role: 'user',
+              content: '(Internal check, not from the customer: you quoted figures without running your tools. Call get_customer_accounts and calculate_relief_options now, then answer again using only the numbers they return. Do not mention this check.)',
+            });
+            continue;
+          }
           reply = text;
           break;
         }
@@ -482,6 +503,7 @@ export class Pia {
         const results = [];
         for (const call of toolUses) {
           toolCalls += 1;
+          if (call.name === 'calculate_relief_options' || call.name === 'get_customer_accounts') this.dataToolUsed.add(conversationId);
           let result;
           try {
             result = await this.runTool(call.name, call.input || {}, session, conversationId, channel, knowledgeTool, handoffTool);
