@@ -556,7 +556,7 @@ export class Pia {
       // Tool-use loop: at most 6 model round trips per customer turn.
       for (let round = 1; round <= 6; round += 1) {
         const t0 = Date.now();
-        const resp = await claude.messages({ system, messages, tools, maxTokens: channel === 'VOICE' ? 400 : 800, purpose: `turn ${round}` });
+        const resp = await claude.messages({ system, messages, tools, maxTokens: channel === 'VOICE' ? 1200 : 2000, purpose: `turn ${round}` });
         const toolUses = (resp.content || []).filter((b) => b.type === 'tool_use');
         const text = (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
         tlog.info(
@@ -617,7 +617,7 @@ export class Pia {
         const last = nudge[nudge.length - 1];
         const instruction = { type: 'text', text: 'Now reply to the customer in your normal style. Do not call tools.' };
         nudge[nudge.length - 1] = { role: 'user', content: Array.isArray(last.content) ? [...last.content, instruction] : `${last.content}\n\n${instruction.text}` };
-        const resp = await claude.messages({ system, messages: nudge, maxTokens: channel === 'VOICE' ? 300 : 600, purpose: 'final reply' });
+        const resp = await claude.messages({ system, messages: nudge, maxTokens: channel === 'VOICE' ? 1200 : 1500, purpose: 'final reply' });
         reply = (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
         tlog.info({ chars: reply.length, stop: resp.stop_reason }, 'Final reply after nudge');
       }
@@ -625,7 +625,7 @@ export class Pia {
       tlog.error({ err: err.message }, 'LLM turn failed; retrying once with a plain-text transcript');
       bus.emit('error', { message: err.message }, conversationId, channel);
       try {
-        const resp = await claude.messages({ system, messages: plainTranscript(messages), maxTokens: channel === 'VOICE' ? 300 : 700, purpose: 'recovery' });
+        const resp = await claude.messages({ system, messages: plainTranscript(messages), maxTokens: channel === 'VOICE' ? 1200 : 1500, purpose: 'recovery' });
         reply = (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
         tlog.info({ chars: reply.length }, 'Recovered with plain-text transcript');
         // Replace this conversation's history with the plain form so later turns don't hit the same error
@@ -701,7 +701,7 @@ export class Pia {
       tlog.debug({ prompt }, 'Opening line prompt');
       try {
         const t0 = Date.now();
-        line = await claude.text(prompt, { maxTokens: 200, timeoutMs: 8000, purpose: 'opening line' });
+        line = await claude.text(prompt, { maxTokens: 1500, timeoutMs: 8000, purpose: 'opening line' });
         tlog.info({ ms: Date.now() - t0, observations: snap.observations.length, summaries: snap.summaries.length }, 'Opening line generated from memory');
       } catch (err) {
         tlog.warn({ err: err.message }, 'Opening line generation failed; using fallback');
