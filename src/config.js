@@ -50,6 +50,8 @@ export const settings = Object.freeze({
    *  audience chats may be handed to Flex at the same time. */
   audienceSyncServiceSid: (process.env.AUDIENCE_SYNC_SERVICE_SID || '').trim(),
   audienceHandoffCap: Number(process.env.AUDIENCE_HANDOFF_CAP || 3),
+  /** Audience Serverless domain (no scheme): receives audience chats' events after handoff. */
+  audienceFunctionsDomain: (process.env.AUDIENCE_FUNCTIONS_DOMAIN || '').trim(),
   /** Serverless domain (no scheme) hosting /webhooks/co-events, and its shared secret. */
   functionsDomain: required('FUNCTIONS_DOMAIN'),
   webhookKey: required('WEBHOOK_KEY'),
@@ -75,6 +77,9 @@ export const settings = Object.freeze({
 export const baseUrl = `https://${settings.publicDomain}`;
 /** Serverless webhook that receives a conversation's events after handoff (Flex live assist). */
 export const coEventsUrl = `https://${settings.functionsDomain}/webhooks/co-events?key=${encodeURIComponent(settings.webhookKey)}`;
+/** Same, for an audience attendee's conversation (their live view lives in the audience service). */
+export const audienceCoEventsUrl = (attendeeKey) =>
+  `https://${settings.audienceFunctionsDomain}/webhooks/co-events?key=${encodeURIComponent(settings.webhookKey)}&a=${encodeURIComponent(attendeeKey)}`;
 export const firstName = settings.customerName.split(/\s+/)[0];
 
 /** Addresses that identify the customer in Orchestrator communications. */

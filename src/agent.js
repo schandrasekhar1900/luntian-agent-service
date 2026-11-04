@@ -27,7 +27,7 @@ import {
   createKnowledgeSearchToolAsync,
   createStudioHandoffTool,
 } from 'twilio-agent-connect';
-import { coEventsUrl, firstName, settings } from './config.js';
+import { audienceCoEventsUrl, coEventsUrl, firstName, settings } from './config.js';
 import * as claude from './claude.js';
 import { getLogger } from './logger.js';
 import { audience, bus, registry, takeOpener } from './events.js';
@@ -330,7 +330,11 @@ export class Pia {
       if (channel === 'CHAT' && result?.status === 'handoff_initiated') {
         // TAC cleared this conversation's callbacks; re-attach to OUR endpoint for the Flex panel.
         // (For voice the Serverless /voice/agent-transcription does it, called from Studio.)
-        void ops.attachStatusCallback(conversationId, coEventsUrl);
+        // Audience chats: send post-handoff events to the AUDIENCE service (their live view), not Mia's
+        const audKeyForEvents = audience.keyForConversation(conversationId);
+        const eventsUrl = audKeyForEvents && settings.audienceFunctionsDomain ? audienceCoEventsUrl(audKeyForEvents) : coEventsUrl;
+        tlog.info({ eventsUrl: eventsUrl.replace(/key=[^&]+/, 'key=…') }, 'Re-attaching conversation events after handoff');
+        void ops.attachStatusCallback(conversationId, eventsUrl);
       }
     } else {
       tlog.warn('Unknown tool requested by the model');
