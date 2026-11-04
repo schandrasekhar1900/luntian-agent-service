@@ -366,9 +366,11 @@ export class Pia {
 
     // Audience attendee? (recognised by Memory profile; their events, loans and bubble are separate)
     const audKey = await audience.keyForProfile(session.profileId);
+    let audScenario = null;
     if (audKey) {
       audience.mark(conversationId, audKey);
       const scenario = await audience.scenario(audKey);
+      audScenario = scenario;
       if (scenario) audienceRecords.set(conversationId, scenario);
       const handedOff = this.audienceHandoffs.has(conversationId);
       audience.updateLive(
@@ -417,6 +419,19 @@ export class Pia {
     const capReached = !!audKey && !this.audienceHandoffs.has(conversationId) && this.audienceHandoffs.size >= settings.audienceHandoffCap;
     const handoffTool = capReached ? null : this.handoffTool(session, audKey);
     const extra = audKey ? [AUDIENCE_RULES] : [];
+    // The attendee's real accounts, stated as authoritative. Memory can contain wrong figures
+    // (e.g. from an earlier test answered with another customer's data), so they must lose.
+    if (audScenario) {
+      const peso = (n) => `₱${Math.round(n).toLocaleString('en-PH')}`;
+      const [car, home] = audScenario.loans;
+      extra.push(
+        `THIS CUSTOMER'S ACCOUNTS (authoritative, from core banking; always use these):\n` +
+          `- Name: ${audScenario.name}\n` +
+          `- Auto loan: ${car.vehicle}, ${peso(car.monthlyAmortization)}/month, balance ${peso(car.outstandingBalance)}, ${car.interestRatePa}% p.a., ${car.remainingTermMonths} months left\n` +
+          `- Home loan: ${home.property}, ${peso(home.monthlyAmortization)}/month, balance ${peso(home.outstandingBalance)}, ${home.interestRatePa}% p.a., ${home.remainingTermMonths} months left\n` +
+          `If memory or earlier messages mention any other name, vehicle, property or figures, they are wrong: ignore them and never repeat them.`
+      );
+    }
     if (capReached) {
       extra.push('ALL LOANS CARE OFFICERS ARE BUSY: if the customer asks for a person, say an officer will message them shortly, and keep helping in the meantime. Do not promise a time.');
       tlog.info({ active: this.audienceHandoffs.size }, 'Audience handoff cap reached: handoff tool withheld');
