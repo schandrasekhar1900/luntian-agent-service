@@ -23,7 +23,22 @@ const URL = 'https://api.anthropic.com/v1/messages';
  * @param {{system?: string, messages: Array<object>, tools?: Array<object>, maxTokens?: number, timeoutMs?: number, purpose?: string}} p
  * @returns {Promise<{content: Array<any>, stop_reason: string, usage: object}>}
  */
-export async function messages({ system, messages: msgs, tools, maxTokens = 1024, timeoutMs = 20000, purpose = 'turn' }) {
+export async function messages(opts) {
+  // Rate limits (429) and overload (529) are retried automatically: wait as long as Anthropic
+  // suggests (retry-after), at most twice, so a busy minute shows as a slower reply, not an error.
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await messagesOnce(opts);
+    } catch (err) {
+      if (!err.retryable || attempt > 2) throw err;
+      const waitMs = Math.min(Math.max(err.retryAfterMs || 2000 * attempt, 1000), 8000);
+      log.warn({ purpose: opts.purpose, attempt, waitMs, status: err.status }, 'Claude busy (rate limit/overload); retrying');
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+}
+
+async function messagesOnce({ system, messages: msgs, tools, maxTokens = 1024, timeoutMs = 20000, purpose = 'turn' }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const t0 = Date.now();
@@ -45,16 +60,25 @@ export async function messages({ system, messages: msgs, tools, maxTokens = 1024
     const json = await res.json().catch(() => ({}));
     if (!res.ok) {
       const msg = json?.error?.message || JSON.stringify(json).slice(0, 300);
-      throw new Error(`Claude HTTP ${res.status} (${json?.error?.type || 'error'}): ${msg}`);
+      const e = new Error(`Claude HTTP ${res.status} (${json?.error?.type || 'error'}): ${msg}`);
+      e.status = res.status;
+      e.retryable = res.status === 429 || res.status === 529;
+      const ra = Number(res.headers?.get?.('retry-after'));
+      if (ra > 0) e.retryAfterMs = ra * 1000;
+      throw e;
     }
     log.debug({ purpose, ms: Date.now() - t0, stop: json.stop_reason, usage: json.usage }, '← Claude');
     return json;
   } catch (err) {
     // Node's fetch hides network-level causes (DNS, TLS, proxy) in err.cause; surface them.
     const cause = err.cause ? ` (${err.cause.code || err.cause.name || 'cause'}: ${err.cause.message || err.cause})` : '';
-    const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs} ms` : `${err.message}${cause}`;
+    const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs} ms` : `${err.message}${err.status ? '' : cause}`;
     log.warn({ purpose, ms: Date.now() - t0, err: reason }, 'Claude call failed');
-    throw new Error(reason);
+    const e = new Error(reason);
+    e.status = err.status;
+    e.retryable = err.retryable;
+    e.retryAfterMs = err.retryAfterMs;
+    throw e;
   } finally {
     clearTimeout(timer);
   }
