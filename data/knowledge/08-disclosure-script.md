@@ -1,0 +1,2 @@
+# Mandatory disclosure for payment holidays (Luntian Bank)
+Before a payment holiday is confirmed, the officer or assistant must clearly tell the customer: "Interest continues to accrue during the payment holiday and will be added to your loan balance, so your monthly amortization will be slightly higher afterwards." The customer must confirm they understand. The officer must also state the exact first paused due date, the date payments resume, and the restructuring fee or the approved waiver. Record the customer's confirmation in the case notes.

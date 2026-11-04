@@ -1,0 +1,2 @@
+# Auto loan pre-termination and partial prepayment (Luntian Bank)
+Customers may pay off their auto loan early at any time. Within the first 24 months a pre-termination fee of 3% of the prepaid principal applies; after 24 months there is no fee. Partial prepayments of at least PHP 50,000 are accepted and can either shorten the remaining term or reduce the monthly amortization, at the customer's choice. To request a payoff amount, customers can ask Lia, call Loans Care, or visit any branch; the quoted amount is valid for 7 days.

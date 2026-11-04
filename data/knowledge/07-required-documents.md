@@ -1,0 +1,2 @@
+# Documents for relief requests (Luntian Bank)
+Payment holiday: completed request form, one valid government ID, and proof of the life event (for maternity leave: the employer's leave approval or SSS maternity notification). Auto refinance: request form, one valid government ID, latest payslip or certificate of employment, and a copy of the vehicle OR/CR. Forms are sent by email or can be signed in the Luntian mobile app. Customers may choose to receive documents by email or by courier to their registered address.

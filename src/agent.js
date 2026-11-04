@@ -18,7 +18,7 @@
  * under-the-hood page and the Flex panel render.
  */
 
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -35,6 +35,40 @@ import * as ops from './twilioOps.js';
 
 const log = getLogger('agent');
 const DATA = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data');
+/**
+ * Bundled copy of the eight Luntian policy articles (same text as Enterprise Knowledge).
+ * Used ONLY as a fallback when the Twilio Knowledge search errors or finds nothing, so Pia
+ * can always answer policy questions on stage.
+ */
+const POLICY_PARAGRAPHS = (() => {
+  const dir = path.join(DATA, 'knowledge');
+  const out = [];
+  try {
+    for (const f of readdirSync(dir).filter((x) => x.endsWith('.md')).sort()) {
+      const text = readFileSync(path.join(dir, f), 'utf8');
+      const lines = text.split('\n');
+      const title = (lines[0] || f).replace(/^#\s*/, '');
+      const body = lines.slice(1).join('\n'); // drop only the heading line; the text may start right below it
+      for (const para of body.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean)) {
+        out.push({ title, file: f, text: para });
+      }
+    }
+  } catch (err) {
+    /* no bundled articles: fallback simply returns nothing */
+  }
+  return out;
+})();
+
+/** Simple keyword search over the bundled articles: top 3 paragraphs, each with its article title. */
+function localPolicySearch(query, top = 3) {
+  const words = String(query).toLowerCase().match(/[a-z]{4,}/g) || [];
+  return POLICY_PARAGRAPHS.map((p) => {
+    const hay = `${p.title} ${p.text}`.toLowerCase();
+    const score = words.reduce((n, w) => n + (hay.includes(w) ? 1 : 0), 0);
+    return { content: `${p.title}: ${p.text}`.slice(0, 900), score: words.length ? score / words.length : 0, knowledgeId: `bundled:${p.file}` };
+  }).filter((c) => c.score > 0).sort((a, b) => b.score - a.score).slice(0, top);
+}
+
 const CUSTOMERS = JSON.parse(readFileSync(path.join(DATA, 'customers.json'), 'utf8'));
 const KNOWLEDGE_TOOL_NAME = 'search_luntian_policies';
 
@@ -67,6 +101,8 @@ How you work:
   something already known. When observations conflict, the most recent one wins (people change their minds).
 - Use get_customer_accounts for balances and amortizations, calculate_relief_options for any figures,
   and search_luntian_policies for policy, rates, fees, eligibility and disclosures. Never invent numbers or policy.
+- Figures your tools returned earlier in this conversation are verified: reuse them confidently and never
+  retract or apologise for them.
 - FIGURES RULE: before you state ANY peso amount, monthly payment, saving, interest cost, rate or term for an
   option, you MUST have called calculate_relief_options (and get_customer_accounts for current balances) in this
   conversation and quote ONLY the numbers those tools returned. If you have not run them yet, run them first.
@@ -276,10 +312,21 @@ export class Pia {
     tlog.info({ args }, 'Tool call');
 
     // Enterprise Knowledge
-    if (knowledgeTool && name === knowledgeTool.name) {
+    if ((knowledgeTool && name === knowledgeTool.name) || name === KNOWLEDGE_TOOL_NAME) {
       const query = args.query || Object.values(args)[0] || '';
       bus.emit('knowledge_search', { query }, conversationId, channel);
-      const chunks = (await knowledgeTool.implementation({ query })) || [];
+      let chunks = [];
+      if (knowledgeTool) {
+        try {
+          chunks = (await knowledgeTool.implementation({ query })) || [];
+        } catch (err) {
+          tlog.warn({ query, err: err.message }, 'Enterprise Knowledge search failed; using bundled policy articles');
+        }
+      }
+      if (!chunks.length) {
+        chunks = localPolicySearch(query);
+        tlog.info({ query, hits: chunks.length }, 'Policy answer from bundled articles (fallback)');
+      }
       tlog.info({ query, hits: chunks.length, topScore: chunks[0]?.score }, 'Knowledge results');
       bus.emit(
         'knowledge_results',
@@ -450,6 +497,12 @@ export class Pia {
     // Claude tool format: { name, description, input_schema }. TAC tools provide toAnthropicFormat().
     const tools = CUSTOM_TOOLS.map(toClaudeTool);
     if (knowledgeTool) tools.push(knowledgeTool.toAnthropicFormat());
+    else
+      tools.push({
+        name: KNOWLEDGE_TOOL_NAME,
+        description: "Search Luntian Bank's loan policies: refinancing, payment holidays, fees and waivers, credit reporting, pre-termination, required documents, disclosures. The input MUST be a question.",
+        input_schema: { type: 'object', properties: { query: { type: 'string', description: 'The question to search for' } }, required: ['query'] },
+      });
     if (handoffTool) tools.push(handoffTool.toAnthropicFormat());
 
     const system = this.systemPrompt(channel, session, memory, extra);
@@ -459,6 +512,7 @@ export class Pia {
     const messages = history[0]?.role === 'assistant'
       ? [{ role: 'user', content: `(The customer opened the ${channel === 'VOICE' ? 'call' : 'chat'}.)` }, ...history]
       : [...history];
+    const turnStart = messages.length; // everything after this index is this turn's tool traffic
 
     let reply = '';
     let toolCalls = 0;
@@ -543,6 +597,18 @@ export class Pia {
     }
 
     reply ||= 'Sige, one moment po.';
+    // Keep this turn's tool calls and results in the history (minus the internal figures check),
+    // so on later turns Pia can see that her figures came from the calculator.
+    const turnMsgs = messages.slice(turnStart);
+    for (let i = 0; i < turnMsgs.length; i += 1) {
+      const m = turnMsgs[i];
+      const next = turnMsgs[i + 1];
+      const isCheck = (x) => x && x.role === 'user' && typeof x.content === 'string' && x.content.startsWith('(Internal check');
+      if (isCheck(m)) continue;
+      if (m.role === 'assistant' && typeof m.content === 'string' && isCheck(next)) continue;
+      history.push(m);
+    }
+    if (history.length && history[history.length - 1].role === 'assistant') history.push({ role: 'user', content: '(continue)' });
     history.push({ role: 'assistant', content: reply });
     bus.emit('agent_message', { text: reply }, conversationId, channel);
     tlog.info({ reply, toolCalls, ms: Date.now() - started }, 'Pia replied');

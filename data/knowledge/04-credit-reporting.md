@@ -1,0 +1,2 @@
+# Credit reporting impact (Luntian Bank)
+Luntian Bank reports loan data to the Credit Information Corporation (CIC). An approved refinance is reported as a new loan with the old loan shown as fully paid; it does not count as a missed payment. An approved payment holiday is reported as a restructured account with status current, not as past due, as long as the customer resumes payments on the agreed date. Missing a payment without an approved holiday is reported as past due after 30 days. Customers can request a copy of their CIC credit report free of charge once a year.
