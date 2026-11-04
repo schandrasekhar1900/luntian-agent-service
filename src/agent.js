@@ -30,7 +30,7 @@ import {
 import { coEventsUrl, firstName, settings } from './config.js';
 import * as claude from './claude.js';
 import { getLogger } from './logger.js';
-import { bus, registry, takeOpener } from './events.js';
+import { audience, bus, registry, takeOpener } from './events.js';
 import * as ops from './twilioOps.js';
 
 const log = getLogger('agent');
@@ -42,6 +42,18 @@ const KNOWLEDGE_TOOL_NAME = 'search_luntian_policies';
 function customerRecord() {
   return CUSTOMERS[settings.customerEmail] || Object.values(CUSTOMERS)[0];
 }
+
+/** Audience attendees' generated scenarios, by conversation (set at the start of each turn). */
+const audienceRecords = new Map();
+/** Record for THIS conversation: the attendee's scenario, else Mia's. */
+function recordFor(conversationId) {
+  return (conversationId && audienceRecords.get(conversationId)) || customerRecord();
+}
+
+/** Extra instructions for audience chats (strangers on their phones, on a projector). */
+const AUDIENCE_RULES = `AUDIENCE DEMO: this customer is a guest at a live event, chatting on their phone while the room
+may watch. Keep every reply to 2-3 short sentences. Stay on Luntian Bank loans; politely decline anything
+unrelated, offensive or personal, without lecturing. Use only this customer's own loan data from your tools.`;
 
 // --------------------------------------------------------------------------- prompts
 
@@ -136,8 +148,8 @@ const round2 = (n) => Math.round(n * 100) / 100;
  * Relief calculator used by the calculate_relief_options tool.
  * Exported so you can sanity-check the story numbers: `node -e "..."`.
  */
-export function calculateRelief({ option, new_term_months, annual_rate, holiday_months } = {}) {
-  const loans = Object.fromEntries(customerRecord().loans.map((l) => [l.type, l]));
+export function calculateRelief({ option, new_term_months, annual_rate, holiday_months } = {}, record = customerRecord()) {
+  const loans = Object.fromEntries(record.loans.map((l) => [l.type, l]));
   if (option === 'refinance_auto') {
     const loan = loans.AUTO;
     const term = new_term_months || 48;
@@ -180,6 +192,8 @@ export class Pia {
   /** @param {import('twilio-agent-connect').TAC} tac */
   constructor(tac) {
     this.tac = tac;
+    /** Audience conversations currently handed to Flex (for the concurrent-handoff cap) */
+    this.audienceHandoffs = new Set();
     /** @type {Map<string, Array<object>>} chat history per Orchestrator conversation */
     this.history = new Map();
     /**
@@ -191,6 +205,12 @@ export class Pia {
     this.knowledgeTool = null;
     this.knowledgeClient = tac.getKnowledgeClient() || new KnowledgeClient(tac.getConfig());
     log.info({ model: settings.anthropicModel, knowledgeBase: settings.knowledgeBaseId || null }, 'Pia initialised');
+  }
+
+  /** Conversation closed: free its handoff slot and per-conversation data. */
+  release(conversationId) {
+    this.audienceHandoffs.delete(conversationId);
+    audienceRecords.delete(conversationId);
   }
 
   forget(conversationId) {
@@ -223,11 +243,15 @@ export class Pia {
   // ------------------------------------------------------------------ tools
 
   /** TAC's Studio handoff tool for this session (null if not configured). */
-  handoffTool(session) {
+  handoffTool(session, audienceKey = null) {
     if (!settings.studioFlowSid) return null;
+    const rec = recordFor(session.conversationId);
+    const attributes = audienceKey
+      ? { department: 'loans_care', brand: 'Luntian Bank', customerName: rec.name, demo: 'audience', attendeeKey: audienceKey }
+      : { department: 'loans_care', brand: 'Luntian Bank', customerName: settings.customerName };
     try {
       return createStudioHandoffTool(this.tac, session, {
-        attributes: { department: 'loans_care', brand: 'Luntian Bank', customerName: settings.customerName },
+        attributes,
         description:
           'Transfer the customer to a human Loans Care officer in Flex. Use for fee waivers, exceptions, hardship ' +
           'approvals, restructuring submissions, complaints, or when the customer asks for a person. ' +
@@ -266,9 +290,10 @@ export class Pia {
     let result;
 
     if (name === 'get_customer_accounts') {
-      result = customerRecord();
+      const { seedObservations, hint, ...rec } = recordFor(conversationId); // tools never see demo-only fields
+      result = rec;
     } else if (name === 'calculate_relief_options') {
-      result = calculateRelief(args);
+      result = calculateRelief(args, recordFor(conversationId));
     } else if (name === 'save_customer_note') {
       // Memory extraction only runs when a conversation closes, so facts the next
       // channel must know immediately are written straight to the Memory API.
@@ -296,6 +321,12 @@ export class Pia {
       tlog.info({ result }, 'Handoff tool returned');
       bus.emit('handoff', { reason, result }, conversationId, channel);
       registry.upsert(conversationId, { status: 'HANDED_OFF', handoffReason: reason });
+      const audKey = audience.keyForConversation(conversationId);
+      if (audKey && result?.status === 'handoff_initiated') {
+        this.audienceHandoffs.add(conversationId);
+        audience.updateLive(audKey, { status: 'with_officer', handoffReason: reason }, { conversationId, status: 'HANDED_OFF', handoffReason: reason });
+        tlog.info({ audKey, active: this.audienceHandoffs.size }, 'Audience handoff to Flex');
+      }
       if (channel === 'CHAT' && result?.status === 'handoff_initiated') {
         // TAC cleared this conversation's callbacks; re-attach to OUR endpoint for the Flex panel.
         // (For voice the Serverless /voice/agent-transcription does it, called from Studio.)
@@ -313,9 +344,9 @@ export class Pia {
 
   // ------------------------------------------------------------------ one customer turn
 
-  systemPrompt(channel, session, memory) {
+  systemPrompt(channel, session, memory, extra = []) {
     const now = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', dateStyle: 'full', timeStyle: 'short' });
-    const base = [PERSONA, CHANNEL_STYLE[channel] || CHANNEL_STYLE.CHAT, `Now: ${now} (Manila)`].join('\n\n');
+    const base = [PERSONA, CHANNEL_STYLE[channel] || CHANNEL_STYLE.CHAT, ...extra, `Now: ${now} (Manila)`].join('\n\n');
     // MemoryPromptBuilder.compose appends profile traits, observations, summaries
     // and recent communications in TAC's standard format.
     return MemoryPromptBuilder.compose(base, memory, session);
@@ -333,6 +364,21 @@ export class Pia {
     const tlog = log.child({ conversationId, channel });
     tlog.info({ message, profileId: session.profileId, callSid: session.callSid, chatSid }, 'Customer turn received');
 
+    // Audience attendee? (recognised by Memory profile; their events, loans and bubble are separate)
+    const audKey = await audience.keyForProfile(session.profileId);
+    if (audKey) {
+      audience.mark(conversationId, audKey);
+      const scenario = await audience.scenario(audKey);
+      if (scenario) audienceRecords.set(conversationId, scenario);
+      const handedOff = this.audienceHandoffs.has(conversationId);
+      audience.updateLive(
+        audKey,
+        { channel, conversationId, chatSid, lastMessage: String(message).slice(0, 140), ...(handedOff ? {} : { status: 'with_pia' }) },
+        { conversationId, channel, status: handedOff ? 'HANDED_OFF' : 'ACTIVE' }
+      );
+      tlog.info({ audKey, vehicle: scenario?.loans?.[0]?.vehicle }, 'Audience turn');
+    }
+
     registry.upsert(conversationId, { channel, profileId: session.profileId, callSid: session.callSid, chatSid });
 
     // First turn of this conversation: fold in Pia's memory-informed opening line.
@@ -343,7 +389,7 @@ export class Pia {
       // Voice opening lines are generated here (kept in memory); chat ones by the
       // Serverless /chat/greet Function (parked in Sync map "openers").
       const localKey = [chatSid, session.callSid].find((k) => k && this.pendingOpeners.has(k));
-      const opener = localKey ? this.pendingOpeners.get(localKey) : await takeOpener(chatSid);
+      const opener = localKey ? this.pendingOpeners.get(localKey) : audKey ? await audience.takeOpener(chatSid) : await takeOpener(chatSid);
       if (localKey) this.pendingOpeners.delete(localKey);
       if (opener) {
         history.push({ role: 'assistant', content: opener });
@@ -367,13 +413,20 @@ export class Pia {
     history.push({ role: 'user', content: message });
 
     const knowledgeTool = await this.getKnowledgeTool();
-    const handoffTool = this.handoffTool(session);
+    // Audience: at most AUDIENCE_HANDOFF_CAP chats handed to Flex at once; beyond that Pia keeps helping
+    const capReached = !!audKey && !this.audienceHandoffs.has(conversationId) && this.audienceHandoffs.size >= settings.audienceHandoffCap;
+    const handoffTool = capReached ? null : this.handoffTool(session, audKey);
+    const extra = audKey ? [AUDIENCE_RULES] : [];
+    if (capReached) {
+      extra.push('ALL LOANS CARE OFFICERS ARE BUSY: if the customer asks for a person, say an officer will message them shortly, and keep helping in the meantime. Do not promise a time.');
+      tlog.info({ active: this.audienceHandoffs.size }, 'Audience handoff cap reached: handoff tool withheld');
+    }
     // Claude tool format: { name, description, input_schema }. TAC tools provide toAnthropicFormat().
     const tools = CUSTOM_TOOLS.map(toClaudeTool);
     if (knowledgeTool) tools.push(knowledgeTool.toAnthropicFormat());
     if (handoffTool) tools.push(handoffTool.toAnthropicFormat());
 
-    const system = this.systemPrompt(channel, session, memory);
+    const system = this.systemPrompt(channel, session, memory, extra);
     tlog.debug({ system }, 'System prompt');
     // Claude's Messages API wants the first message from the user. On turn one the
     // history starts with Pia's opening line, so we prefix a short context note.

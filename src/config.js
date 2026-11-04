@@ -46,6 +46,10 @@ export const settings = Object.freeze({
 
   /** Shared live-event bus: Twilio Sync service (same as the Serverless service). */
   syncServiceSid: required('SYNC_SERVICE_SID'),
+  /** Audience segment: its own Sync service (empty = audience features off), and how many
+   *  audience chats may be handed to Flex at the same time. */
+  audienceSyncServiceSid: (process.env.AUDIENCE_SYNC_SERVICE_SID || '').trim(),
+  audienceHandoffCap: Number(process.env.AUDIENCE_HANDOFF_CAP || 3),
   /** Serverless domain (no scheme) hosting /webhooks/co-events, and its shared secret. */
   functionsDomain: required('FUNCTIONS_DOMAIN'),
   webhookKey: required('WEBHOOK_KEY'),

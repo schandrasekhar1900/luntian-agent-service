@@ -56,23 +56,23 @@ function fit(event) {
   return json.length <= MAX_ITEM_BYTES ? copy : { ...copy, data: { truncated: true, preview: json.slice(0, 2000) } };
 }
 
-async function appendToList(listName, data) {
+async function appendToList(listName, data, svc = sync) {
   try {
-    await sync.syncLists(listName).syncListItems.create({ data, itemTtl: LIST_TTL });
+    await svc.syncLists(listName).syncListItems.create({ data, itemTtl: LIST_TTL });
   } catch (err) {
     if (err.status !== 404) throw err;
     log.debug({ listName }, 'Sync list missing; creating it');
     try {
-      await sync.syncLists.create({ uniqueName: listName, ttl: LIST_TTL });
+      await svc.syncLists.create({ uniqueName: listName, ttl: LIST_TTL });
     } catch (e) {
       if (e.status !== 409) throw e;
     }
-    await sync.syncLists(listName).syncListItems.create({ data, itemTtl: LIST_TTL });
+    await svc.syncLists(listName).syncListItems.create({ data, itemTtl: LIST_TTL });
   }
 }
 
-async function mapSet(mapName, key, data) {
-  const items = () => sync.syncMaps(mapName).syncMapItems;
+async function mapSet(mapName, key, data, svc = sync) {
+  const items = () => svc.syncMaps(mapName).syncMapItems;
   try {
     await items()(key).update({ data });
   } catch (err) {
@@ -83,7 +83,7 @@ async function mapSet(mapName, key, data) {
       if (e.status !== 404) throw e;
       log.debug({ mapName }, 'Sync map missing; creating it');
       try {
-        await sync.syncMaps.create({ uniqueName: mapName });
+        await svc.syncMaps.create({ uniqueName: mapName });
       } catch (e2) {
         if (e2.status !== 409) throw e2;
       }
@@ -92,9 +92,9 @@ async function mapSet(mapName, key, data) {
   }
 }
 
-async function mapGet(mapName, key) {
+async function mapGet(mapName, key, svc = sync) {
   try {
-    return (await sync.syncMaps(mapName).syncMapItems(key).fetch()).data;
+    return (await svc.syncMaps(mapName).syncMapItems(key).fetch()).data;
   } catch (err) {
     if (err.status !== 404) log.warn({ mapName, key, err: err.message }, 'Sync map read failed');
     return null;
@@ -108,6 +108,16 @@ export const bus = {
    */
   emit(type, data = {}, conversationId = null, channel = null, ref = null) {
     const event = fit({ id: randomUUID().slice(0, 12), ts: new Date().toISOString(), type, conversationId, channel, ref, data });
+    // Audience conversations go ONLY to that attendee's list in the audience Sync service
+    const audKey = conversationId ? audConvs.get(conversationId) : null;
+    if (audKey && audSync) {
+      const listName = `events-att-${audKey}`;
+      enqueue(`aud:${listName}`, () => appendToList(listName, event, audSync)).catch((err) =>
+        log.warn({ type, list: listName, err: err.message }, 'Audience event publish failed')
+      );
+      log.debug({ type, conversationId, audience: audKey }, 'Audience event published');
+      return event;
+    }
     const targets = ['events-all', ...(conversationId ? [`events-${conversationId}`] : [])];
     for (const name of targets) {
       enqueue(name, () => appendToList(name, event)).catch((err) =>
@@ -128,6 +138,9 @@ export const registry = {
    * index keys) to Sync map "registry". Fire-and-forget; returns the merged record.
    */
   upsert(conversationId, fields = {}) {
+    // Audience conversations are tracked in the audience Sync service, not the main registry
+    // (keeps the main demo's brain view and Flex briefing free of audience traffic).
+    if (audConvs.has(conversationId)) return { conversationId, ...fields };
     const isNew = !records.has(conversationId);
     const record = records.get(conversationId) || { conversationId, startedAt: new Date().toISOString(), status: 'ACTIVE' };
     const changed = {};
@@ -165,4 +178,81 @@ export async function takeOpener(key) {
   return item.line;
 }
 
-log.info({ service: settings.syncServiceSid }, 'Sync event bus ready');
+// =====================================================================================
+// Audience segment (separate Sync service). Recognises audience chats by Memory profile:
+// /audience/start writes "aud_profiles" (profileId -> attendee key) before the first message.
+// =====================================================================================
+
+const audSync = settings.audienceSyncServiceSid ? client.sync.v1.services(settings.audienceSyncServiceSid) : null;
+/** conversationId -> attendee key, for every audience conversation this process has seen */
+const audConvs = new Map();
+/** profileId -> { key|null, at } (negative results cached briefly; Mia's profile is never audience) */
+const audProfileCache = new Map();
+/** attendee key -> scenario (loans etc.) */
+const audScenarioCache = new Map();
+
+export const audience = {
+  enabled: !!audSync,
+
+  /** Attendee key for a Memory profile, or null if it is not an audience profile. */
+  async keyForProfile(profileId) {
+    if (!audSync || !profileId) return null;
+    const cached = audProfileCache.get(profileId);
+    if (cached && (cached.key || Date.now() - cached.at < 5 * 60 * 1000)) return cached.key;
+    const item = await mapGet('aud_profiles', profileId, audSync);
+    const key = item?.key || null;
+    audProfileCache.set(profileId, { key, at: Date.now() });
+    if (key) log.info({ profileId, key }, 'Audience profile recognised');
+    return key;
+  },
+
+  /** Remember that a conversation belongs to an attendee (routes its events and registry). */
+  mark(conversationId, key) {
+    if (conversationId && key && !audConvs.has(conversationId)) {
+      audConvs.set(conversationId, key);
+      log.info({ conversationId, key }, 'Audience conversation');
+    }
+  },
+
+  keyForConversation(conversationId) {
+    return audConvs.get(conversationId) || null;
+  },
+
+  async scenario(key) {
+    if (audScenarioCache.has(key)) return audScenarioCache.get(key);
+    const s = await mapGet('aud_scenarios', key, audSync);
+    if (s) audScenarioCache.set(key, s);
+    return s;
+  },
+
+  /** Read and delete the opening line /audience/greet parked for a chat SID. */
+  async takeOpener(chatSid) {
+    if (!audSync || !chatSid) return null;
+    const item = await mapGet('openers', chatSid, audSync);
+    if (!item?.line) return null;
+    audSync.syncMaps('openers').syncMapItems(chatSid).remove().catch(() => undefined);
+    return item.line;
+  },
+
+  /**
+   * Merge fields into an attendee's live state ("aud_live", drives the dashboard bubble).
+   * Optionally records a conversation in their journey. Serialised per attendee.
+   */
+  updateLive(key, fields = {}, conversation = null) {
+    if (!audSync || !key) return;
+    enqueue(`aud-live:${key}`, async () => {
+      const cur = (await mapGet('aud_live', key, audSync)) || { key, conversations: [] };
+      const next = { ...cur, ...fields, updatedAt: new Date().toISOString() };
+      if (conversation) {
+        const list = Array.isArray(cur.conversations) ? [...cur.conversations] : [];
+        const i = list.findIndex((c) => c.conversationId === conversation.conversationId);
+        if (i === -1) list.push({ startedAt: new Date().toISOString(), ...conversation });
+        else list[i] = { ...list[i], ...conversation };
+        next.conversations = list;
+      }
+      await mapSet('aud_live', key, next, audSync);
+    }).catch((err) => log.warn({ key, err: err.message }, 'Audience live update failed'));
+  },
+};
+
+log.info({ service: settings.syncServiceSid, audienceService: settings.audienceSyncServiceSid || '(audience off)' }, 'Sync event bus ready');

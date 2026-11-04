@@ -24,7 +24,7 @@
 import { ChatChannel, TAC, TACConfig, TACServer, VoiceChannel } from 'twilio-agent-connect';
 import { Pia } from './agent.js';
 import { baseUrl, settings } from './config.js';
-import { bus, registry } from './events.js';
+import { audience, bus, registry } from './events.js';
 import { getLogger } from './logger.js';
 import * as ops from './twilioOps.js';
 
@@ -66,6 +66,9 @@ tac.onConversationEnded(({ session }) => {
   log.info({ conversationId: session.conversationId, channel }, 'Conversation ended: Memory extraction runs on close');
   registry.upsert(session.conversationId, { status: 'CLOSED' });
   bus.emit('conversation_status', { status: 'CLOSED', note: 'Memory extraction runs on close' }, session.conversationId, channel);
+  const audKey = audience.keyForConversation(session.conversationId);
+  if (audKey) audience.updateLive(audKey, { status: 'ended' }, { conversationId: session.conversationId, status: 'CLOSED' });
+  lia.release(session.conversationId);
   lia.forget(session.conversationId);
 });
 
@@ -124,8 +127,16 @@ app.addHook('onResponse', async (request, reply) => {
     log.info({ conversationId, status: data.status }, 'Orchestrator: conversation status changed');
     registry.upsert(conversationId, { status: data.status });
     bus.emit('conversation_status', { status: data.status }, conversationId);
+    const audKey = audience.keyForConversation(conversationId);
+    if (audKey) audience.updateLive(audKey, data.status === 'CLOSED' ? { status: 'ended' } : {}, { conversationId, status: data.status });
   } else if (eventType === 'PARTICIPANT_ADDED' && conversationId && data.profileId) {
     log.info({ conversationId, profileId: data.profileId, type: data.type }, 'Orchestrator: participant linked to Memory profile');
+    // Audience attendee? Mark it first so this and later events go to their own live view.
+    const audKey = await audience.keyForProfile(data.profileId);
+    if (audKey) {
+      audience.mark(conversationId, audKey);
+      audience.updateLive(audKey, { conversationId }, { conversationId, channel: data.addresses?.[0]?.channel || 'CHAT', status: 'ACTIVE' });
+    }
     registry.upsert(conversationId, { profileId: data.profileId });
     bus.emit('profile_resolved', { profileId: data.profileId, participantType: data.type }, conversationId);
   }
