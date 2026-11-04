@@ -169,6 +169,37 @@ const CUSTOM_TOOLS = [
   },
 ];
 
+/** Keep only blocks Claude accepts back in history: non-empty text, tool_use, tool_result. */
+function cleanContent(content) {
+  if (typeof content === 'string') return content.trim() ? content : null;
+  if (!Array.isArray(content)) return null;
+  const kept = content
+    .filter((b) => (b.type === 'text' && String(b.text || '').trim()) || b.type === 'tool_use' || b.type === 'tool_result')
+    .map((b) => (b.type === 'text' ? { type: 'text', text: b.text } : b.type === 'tool_use' ? { type: 'tool_use', id: b.id, name: b.name, input: b.input || {} } : { type: 'tool_result', tool_use_id: b.tool_use_id, content: String(b.content ?? '') }));
+  return kept.length ? kept : null;
+}
+
+/**
+ * Plain-text version of a conversation for the recovery call: tool calls become short
+ * text notes, roles strictly alternate, first message is from the user.
+ */
+function plainTranscript(msgs) {
+  const out = [];
+  for (const m of msgs) {
+    let text = '';
+    if (typeof m.content === 'string') text = m.content;
+    else if (Array.isArray(m.content)) {
+      text = m.content.map((b) => (b.type === 'text' ? b.text : b.type === 'tool_use' ? `[called ${b.name}]` : b.type === 'tool_result' ? `[${b.name || 'tool'} result: ${String(b.content).slice(0, 1500)}]` : '')).filter(Boolean).join('\n');
+    }
+    if (!text.trim()) continue;
+    if (out.length && out[out.length - 1].role === m.role) out[out.length - 1].content += `\n${text}`;
+    else out.push({ role: m.role, content: text });
+  }
+  if (out.length && out[0].role !== 'user') out.unshift({ role: 'user', content: '(The customer opened the chat.)' });
+  if (out.length && out[out.length - 1].role !== 'user') out.push({ role: 'user', content: '(continue)' });
+  return out;
+}
+
 /** Convert an OpenAI-style function tool to Claude's tool format. */
 function toClaudeTool(tool) {
   return { name: tool.function.name, description: tool.function.description, input_schema: tool.function.parameters };
@@ -591,9 +622,21 @@ export class Pia {
         tlog.info({ chars: reply.length, stop: resp.stop_reason }, 'Final reply after nudge');
       }
     } catch (err) {
-      tlog.error({ err: err.message }, 'LLM turn failed');
+      tlog.error({ err: err.message }, 'LLM turn failed; retrying once with a plain-text transcript');
       bus.emit('error', { message: err.message }, conversationId, channel);
-      reply = 'Pasensya na, I hit a snag on my side. Could you say that again?';
+      try {
+        const resp = await claude.messages({ system, messages: plainTranscript(messages), maxTokens: channel === 'VOICE' ? 300 : 700, purpose: 'recovery' });
+        reply = (resp.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+        tlog.info({ chars: reply.length }, 'Recovered with plain-text transcript');
+        // Replace this conversation's history with the plain form so later turns don't hit the same error
+        const plain = plainTranscript(history);
+        history.length = 0;
+        history.push(...plain);
+        if (history.length && history[history.length - 1].content === '(continue)') history.pop();
+      } catch (err2) {
+        tlog.error({ err: err2.message }, 'Recovery call failed too');
+        reply = 'Pasensya na, I hit a snag on my side. Could you say that again?';
+      }
     }
 
     reply ||= 'Sige, one moment po.';
@@ -606,7 +649,10 @@ export class Pia {
       const isCheck = (x) => x && x.role === 'user' && typeof x.content === 'string' && x.content.startsWith('(Internal check');
       if (isCheck(m)) continue;
       if (m.role === 'assistant' && typeof m.content === 'string' && isCheck(next)) continue;
-      history.push(m);
+      const content = cleanContent(m.content);
+      if (!content) continue;
+      if (history.length && history[history.length - 1].role === m.role) continue; // keep roles alternating
+      history.push({ role: m.role, content });
     }
     if (history.length && history[history.length - 1].role === 'assistant') history.push({ role: 'user', content: '(continue)' });
     history.push({ role: 'assistant', content: reply });
