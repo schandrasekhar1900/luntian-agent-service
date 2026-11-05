@@ -26,6 +26,7 @@ import {
   MemoryPromptBuilder,
   createKnowledgeSearchToolAsync,
   createStudioHandoffTool,
+  TACMemoryResponse,
 } from 'twilio-agent-connect';
 import { audienceCoEventsUrl, coEventsUrl, firstName, settings } from './config.js';
 import * as claude from './claude.js';
@@ -120,6 +121,9 @@ How you work:
 
 const CHANNEL_STYLE = {
   CHAT: 'CHANNEL: web chat. Plain text only (no markdown, no bullets, no headings). At most 3 short paragraphs.',
+  WHATSAPP:
+    'CHANNEL: WhatsApp on the customer\'s phone. Plain text, no markdown. Keep it short: 2-3 brief sentences per ' +
+    'message, at most one emoji if it fits. Peso amounts as digits (e.g. ₱29,079.56).',
   VOICE:
     'CHANNEL: phone call. Reply in one or two short spoken sentences. No lists, symbols or markdown. ' +
     "Say amounts naturally, e.g. 'about twenty-seven thousand pesos a month'. Ask one question at a time. " +
@@ -170,6 +174,20 @@ const CUSTOM_TOOLS = [
     },
   },
 ];
+
+/**
+ * Remove anything not meant for the customer: paragraphs that are notes or asides
+ * ("*Note: …*", "(I used …)"), and markdown emphasis around them. Keeps everything else.
+ */
+function stripNotes(text) {
+  if (!text) return text;
+  const paras = String(text).split(/\n\s*\n/);
+  const kept = paras.filter((p) => {
+    const t = p.trim();
+    return !/^[*_(\[]*\s*(note|nb|n\.b\.|p\.s\.|internal|explanation|aside|reasoning)\b/i.test(t) && !/^[(\[][^)\]]*[)\]]$/.test(t);
+  });
+  return (kept.length ? kept : paras).join('\n\n').trim();
+}
 
 /** Keep only blocks Claude accepts back in history: non-empty text, tool_use, tool_result. */
 function cleanContent(content) {
@@ -265,6 +283,8 @@ export class Pia {
   /** @param {import('twilio-agent-connect').TAC} tac */
   constructor(tac) {
     this.tac = tac;
+    /** Browser calls from attendees: CallSid -> { key, profileId } (set when the call comes in) */
+    this.callAudience = new Map();
     /** Conversations where Pia has already run the calculator or account lookup (figures guard) */
     this.dataToolUsed = new Set();
     /** Audience conversations currently handed to Flex (for the concurrent-handoff cap) */
@@ -414,7 +434,7 @@ export class Pia {
         audience.updateLive(audKey, { status: 'with_officer', handoffReason: reason }, { conversationId, status: 'HANDED_OFF', handoffReason: reason });
         tlog.info({ audKey, active: this.audienceHandoffs.size }, 'Audience handoff to Flex');
       }
-      if (channel === 'CHAT' && result?.status === 'handoff_initiated') {
+      if ((channel === 'CHAT' || channel === 'WHATSAPP') && result?.status === 'handoff_initiated') {
         // TAC cleared this conversation's callbacks; re-attach to OUR endpoint for the Flex panel.
         // (For voice the Serverless /voice/agent-transcription does it, called from Studio.)
         // Audience chats: send post-handoff events to the AUDIENCE service (their live view), not Mia's
@@ -455,8 +475,26 @@ export class Pia {
     const tlog = log.child({ conversationId, channel });
     tlog.info({ message, profileId: session.profileId, callSid: session.callSid, chatSid }, 'Customer turn received');
 
-    // Audience attendee? (recognised by Memory profile; their events, loans and bubble are separate)
-    const audKey = await audience.keyForProfile(session.profileId);
+    // Audience attendee? Recognised by Memory profile, or (browser calls from their chat page)
+    // by the CallSid registered when the call came in. For browser calls, Orchestrator can't
+    // link the browser identity to their profile, so we point the session at their real profile
+    // and use its memory: same history as their chat.
+    const browserCall = session.callSid ? this.callAudience.get(session.callSid) : null;
+    if (browserCall && session.profileId !== browserCall.profileId) {
+      tlog.info({ from: session.profileId, to: browserCall.profileId }, 'Browser call: using the attendee\'s own profile');
+      session.profileId = browserCall.profileId;
+      try {
+        // Same object Agent Connect builds for every turn (its prompt builder needs it)
+        const memoryClient = this.tac.getMemoryClient();
+        const raw = await memoryClient.retrieveMemories(browserCall.profileId, { conversationId, query: String(message).slice(0, 200), observationsLimit: 20, summariesLimit: 5 });
+        memory = new TACMemoryResponse(raw);
+        const profile = await memoryClient.getProfile(browserCall.profileId).catch(() => null);
+        if (profile) session.profile = { ...(session.profile || {}), traits: profile.traits || {} };
+      } catch (err) {
+        tlog.warn({ err: err.message }, 'Browser call: could not load the attendee\'s memory');
+      }
+    }
+    const audKey = browserCall?.key || (await audience.keyForProfile(session.profileId));
     let audScenario = null;
     if (audKey) {
       audience.mark(conversationId, audKey);
@@ -641,6 +679,7 @@ export class Pia {
       }
     }
 
+    reply = stripNotes(reply);
     reply ||= 'Sige, one moment po.';
     // Keep this turn's tool calls and results in the history (minus the internal figures check),
     // so on later turns Pia can see that her figures came from the calculator.
@@ -710,6 +749,7 @@ export class Pia {
         tlog.warn({ err: err.message }, 'Opening line generation failed; using fallback');
         line = '';
       }
+      line = stripNotes(line);
       // Never greet with silence: an empty reply falls back to a line that still shows we remember
       if (!line) {
         tlog.warn('Opening line came back empty; using the memory-aware fallback');
