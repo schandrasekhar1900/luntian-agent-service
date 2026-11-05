@@ -21,7 +21,7 @@
  * Run: npm start (after npm install and filling .env).
  */
 
-import { ChatChannel, TAC, TACConfig, TACServer, VoiceChannel } from 'twilio-agent-connect';
+import { ChatChannel, TAC, TACConfig, TACServer, VoiceChannel, WhatsAppChannel } from 'twilio-agent-connect';
 import { Pia } from './agent.js';
 import { baseUrl, settings } from './config.js';
 import { audience, bus, registry } from './events.js';
@@ -52,9 +52,26 @@ const chatChannel = new ChatChannel(tac, { agentAddress: settings.chatAgentIdent
  * Voice: ConversationRelay. memoryMode "once" = one recall per call (lower latency).
  * The greeting is replaced per call by onInboundCallTwiml below.
  */
+/**
+ * Pia's spoken voice (ConversationRelay text-to-speech). Set on Render, no code change needed:
+ *   PIA_TTS_PROVIDER  ElevenLabs | Google | Amazon        (default: ConversationRelay's, ElevenLabs)
+ *   PIA_VOICE         the voice ID, e.g. an ElevenLabs ID from the ConversationRelay voice picker,
+ *                     or a Google ID such as fil-PH-Wavenet-A
+ *   PIA_TTS_LANGUAGE  e.g. en-US (default) or fil-PH
+ * Unset values are left out, so ConversationRelay's defaults apply.
+ */
+const voiceSettings = Object.fromEntries(
+  [
+    ['ttsProvider', process.env.PIA_TTS_PROVIDER],
+    ['voice', process.env.PIA_VOICE],
+    ['ttsLanguage', process.env.PIA_TTS_LANGUAGE],
+  ].filter(([, v]) => v && String(v).trim()).map(([k, v]) => [k, String(v).trim()])
+);
+log.info({ voice: Object.keys(voiceSettings).length ? voiceSettings : 'ConversationRelay default' }, 'Pia voice settings');
+
 const voiceChannel = new VoiceChannel(tac, {
   memoryMode: 'once',
-  defaultTwimlOptions: { welcomeGreeting: 'Hi, this is Pia from Luntian Bank. How can I help you today?', interruptible: 'speech' },
+  defaultTwimlOptions: { welcomeGreeting: 'Hi, this is Pia from Luntian Bank. How can I help you today?', interruptible: 'speech', ...voiceSettings },
 });
 
 /** Every customer turn on any channel. TAC sends the returned text on the right channel. */
@@ -80,6 +97,25 @@ voiceChannel.onInboundCallTwiml(async (req) => {
   const vlog = log.child({ callSid: req.callSid });
   vlog.info({ from: req.from, to: req.to }, 'Inbound call to the AI hotline: building memory-informed greeting');
   bus.emit('call_started', { from: req.from, callSid: req.callSid }, null, 'VOICE', req.callSid);
+  // Audience attendee calling from their chat page (browser softphone, identity aud_<key>):
+  // greet from THEIR profile and remember the call so every turn is theirs.
+  const audMatch = String(req.from || '').match(/^client:aud_([a-z0-9_]+)$/);
+  if (audMatch) {
+    const attendeeKey = audMatch[1].replace(/_/g, '-');
+    try {
+      const live = await withTimeout(audience.live(attendeeKey), 2000, 'attendee lookup');
+      if (!live?.profileId) throw new Error('attendee has no profile yet');
+      lia.callAudience.set(req.callSid, { key: attendeeKey, profileId: live.profileId });
+      audience.updateLive(attendeeKey, { channel: 'VOICE', status: 'with_pia', callSid: req.callSid });
+      audience.publish(attendeeKey, 'call_started', { from: 'browser' }, 'VOICE', req.callSid);
+      const line = await withTimeout(lia.openingLine('VOICE', live.profileId, req.callSid), 7000, 'opening line');
+      vlog.info({ attendeeKey, profileId: live.profileId, line }, 'Audience browser call: greeting set');
+      return { welcomeGreeting: line };
+    } catch (err) {
+      vlog.warn({ attendeeKey, err: err.message }, 'Audience browser call: greeting fell back to the default');
+      return {};
+    }
+  }
   try {
     const profileId = await withTimeout(ops.lookupProfileId(tac, { phone: req.from }), 3000, 'profile lookup');
     if (!profileId) vlog.warn({ from: req.from }, 'Caller is not linked to a Memory profile (is DEMO_CUSTOMER_PHONE the number calling?)');
@@ -99,7 +135,21 @@ function withTimeout(promise, ms, label) {
 
 // ============================================================================ HTTP
 
-const server = new TACServer(tac, { port: settings.port, voiceChannel, messagingChannels: [chatChannel], fastify: { logger: false } });
+/**
+ * WhatsApp (audience segment): Agent Connect's built-in WhatsApp channel, enabled only when
+ * TWILIO_WHATSAPP_NUMBER is set (e.g. whatsapp:+14155238886 for the Twilio Sandbox). Inbound
+ * messages reach Pia through the Orchestrator configuration's WHATSAPP capture rule; replies
+ * go out from that number. Customers are recognised by their phone number (Memory profile).
+ */
+const messagingChannels = [chatChannel];
+if ((process.env.TWILIO_WHATSAPP_NUMBER || '').trim()) {
+  messagingChannels.push(new WhatsAppChannel(tac, { memoryMode: 'always' }));
+  log.info({ number: process.env.TWILIO_WHATSAPP_NUMBER }, 'WhatsApp channel enabled');
+} else {
+  log.info('WhatsApp channel off (TWILIO_WHATSAPP_NUMBER not set)');
+}
+
+const server = new TACServer(tac, { port: settings.port, voiceChannel, messagingChannels, fastify: { logger: false } });
 const app = server.fastify;
 
 /** Log every request/response through our logger (TAC's own Fastify logger is off). */
@@ -140,6 +190,55 @@ app.addHook('onResponse', async (request, reply) => {
     registry.upsert(conversationId, { profileId: data.profileId });
     bus.emit('profile_resolved', { profileId: data.profileId, participantType: data.type }, conversationId);
   }
+});
+
+/**
+ * POST /audience/call?key=WEBHOOK_KEY {attendeeKey, phone, profileId}
+ * Called by the audience Serverless /audience/call-me after it added the attendee's mobile
+ * number to their Memory profile. Answers at once (202), then in the background:
+ *   1. waits until Memory resolves that number to the attendee's profile (same profile as chat),
+ *   2. writes Pia's memory-informed spoken greeting,
+ *   3. places the outbound call from the hotline via Agent Connect (ConversationRelay).
+ * When the call connects, Orchestrator links it to the profile, so the audience Pia recognises
+ * the attendee exactly as for chat (scenario, live view, bubble).
+ */
+app.post('/audience/call', async (request, reply) => {
+  if ((request.query?.key || '') !== settings.webhookKey) return reply.code(403).send({ error: 'bad key' });
+  const { attendeeKey, phone, profileId } = request.body || {};
+  if (!attendeeKey || !/^\+\d{8,15}$/.test(String(phone || '')) || !profileId) return reply.code(400).send({ error: 'attendeeKey, phone (E.164) and profileId required' });
+  const clog = log.child({ attendeeKey });
+  clog.info({ phone: `${String(phone).slice(0, 4)}…${String(phone).slice(-3)}` }, 'Audience call requested');
+  audience.updateLive(attendeeKey, { channel: 'VOICE', status: 'calling' });
+  audience.publish(attendeeKey, 'call_started', { note: 'Pia is calling the attendee' }, 'VOICE');
+  reply.code(202).send({ ok: true });
+
+  (async () => {
+    try {
+      // 1. Wait (max ~10 s) until the number resolves to the attendee's existing profile
+      const memory = tac.getMemoryClient();
+      let resolved = null;
+      for (let i = 0; i < 10 && memory; i += 1) {
+        try {
+          const r = await memory.lookupProfile('phone', phone);
+          resolved = r.profiles?.[0] || null;
+          if (resolved === profileId) break;
+        } catch (e) { /* not yet */ }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      clog.info({ resolved, expected: profileId, match: resolved === profileId }, 'Phone number resolution before calling');
+      // 2. Greeting from memory (same as inbound calls)
+      const line = await lia.openingLine('VOICE', profileId, `out-${attendeeKey}`);
+      // 3. Call
+      const result = await voiceChannel.initiateOutboundConversation({ to: phone, twimlOptions: { welcomeGreeting: line } });
+      lia.pendingOpeners.set(result.callSid, line); // first turn picks the greeting up by CallSid
+      clog.info({ callSid: result.callSid }, 'Outbound call placed');
+      audience.updateLive(attendeeKey, { channel: 'VOICE', status: 'with_pia', callSid: result.callSid });
+    } catch (err) {
+      clog.error({ err: err.message }, 'Outbound call failed');
+      audience.updateLive(attendeeKey, { status: 'call_failed' });
+      audience.publish(attendeeKey, 'error', { message: `Call failed: ${err.message}` }, 'VOICE');
+    }
+  })();
 });
 
 app.get('/health', async () => ({ ok: true, memoryStore: tac.getMemoryStoreId() || null, at: new Date().toISOString() }));
