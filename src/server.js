@@ -105,10 +105,13 @@ voiceChannel.onInboundCallTwiml(async (req) => {
     try {
       const live = await withTimeout(audience.live(attendeeKey), 2000, 'attendee lookup');
       if (!live?.profileId) throw new Error('attendee has no profile yet');
-      lia.callAudience.set(req.callSid, { key: attendeeKey, profileId: live.profileId });
+      // Hand the live chat (if any) to the call: greeting and every call turn continue from it
+      const chatContext = live.channel === 'CHAT' || live.chatSid ? lia.recentTranscript(live.conversationId) : '';
+      lia.callAudience.set(req.callSid, { key: attendeeKey, profileId: live.profileId, chatContext });
+      if (chatContext) vlog.info({ attendeeKey, chars: chatContext.length }, 'Audience browser call: continuing from the live chat');
       audience.updateLive(attendeeKey, { channel: 'VOICE', status: 'with_pia', callSid: req.callSid });
       audience.publish(attendeeKey, 'call_started', { from: 'browser' }, 'VOICE', req.callSid);
-      const line = await withTimeout(lia.openingLine('VOICE', live.profileId, req.callSid), 7000, 'opening line');
+      const line = await withTimeout(lia.openingLine('VOICE', live.profileId, req.callSid, chatContext), 7000, 'opening line');
       vlog.info({ attendeeKey, profileId: live.profileId, line }, 'Audience browser call: greeting set');
       return { welcomeGreeting: line };
     } catch (err) {

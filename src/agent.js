@@ -550,6 +550,10 @@ export class Pia {
     const capReached = !!audKey && !this.audienceHandoffs.has(conversationId) && this.audienceHandoffs.size >= settings.audienceHandoffCap;
     const handoffTool = capReached ? null : this.handoffTool(session, audKey);
     const extra = audKey ? [AUDIENCE_RULES] : [];
+    if (browserCall?.chatContext) {
+      extra.push(`EARLIER IN THIS SESSION (web chat, just before this call; it is the current state):\n${browserCall.chatContext}\n` +
+        'Continue from it: do not repeat questions already answered there.');
+    }
     // The attendee's real accounts, stated as authoritative. Memory can contain wrong figures
     // (e.g. from an earlier test answered with another customer's data), so they must lose.
     if (audScenario) {
@@ -712,11 +716,24 @@ export class Pia {
    * @param {string|null} profileId
    * @param {string} key classic chat SID or CallSid, used to link it to the conversation later
    */
-  async openingLine(channel, profileId, key) {
+  /** Recent customer/Pia text of a conversation this service handled (for handing a chat over to a call). */
+  recentTranscript(conversationId, maxChars = 2500) {
+    const h = conversationId ? this.history.get(conversationId) : null;
+    if (!h?.length) return '';
+    const lines = plainTranscript(h)
+      .filter((m) => !/^\((The customer opened|continue)/.test(m.content))
+      .map((m) => `${m.role === 'user' ? 'Customer' : 'Pia'}: ${m.content.replace(/\[[^\]]*result:[^\]]*\]/g, '').trim()}`)
+      .map((l) => l.replace(/\[called [^\]]*\]\s*/g, '').trim())
+      .filter((l) => !/^(Customer|Pia):\s*$/.test(l));
+    const text = lines.join('\n');
+    return text.length > maxChars ? text.slice(-maxChars) : text;
+  }
+
+  async openingLine(channel, profileId, key, liveChat = '') {
     const tlog = log.child({ channel, key });
     const snap = await ops.memorySnapshot(this.tac, profileId, 'loan relief plans, decisions, preferences and next steps');
     const name = snap.traits?.Contact?.firstName || firstName;
-    const coldStart = !(snap.observations.length || snap.summaries.length);
+    const coldStart = !(snap.observations.length || snap.summaries.length || liveChat);
     let line;
 
     if (coldStart) {
@@ -737,7 +754,11 @@ export class Pia {
       const prompt =
         `You are Pia, Luntian Bank's AI assistant. ${name} is a returning customer who has just opened a ` +
         `${channel === 'VOICE' ? 'phone call' : 'web chat'}.\n` +
-        `What we know (oldest first; later entries supersede earlier ones):\n${memoryText}\n\n` +
+        `What we know (oldest first; later entries supersede earlier ones):\n${memoryText || '(nothing yet)'}\n\n` +
+        (liveChat
+          ? `They were chatting with you on web chat moments ago (most recent last); this is the CURRENT state:\n${liveChat}\n\n` +
+            'Continue from that chat: refer to what was just discussed (e.g. the option and figures you gave), not to older history. '
+          : '') +
         "Write Pia's opening message. Greet by first name, reflect the CURRENT state of their plans in one specific " +
         'sentence (ignore superseded plans), and ask one question that moves things forward. ' +
         `Never mention memory, notes or records. ${style}`;
