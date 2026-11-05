@@ -234,6 +234,27 @@ export const audience = {
     return item.line;
   },
 
+  /** An attendee's live state (profileId, status…) from the audience Sync map, or null. */
+  async live(key) {
+    if (!audSync || !key) return null;
+    try {
+      const item = await audSync.syncMaps('aud_live').syncMapItems(key).fetch();
+      return item.data || null;
+    } catch (err) {
+      return null;
+    }
+  },
+
+  /** Publish an event straight to an attendee's live view (before a conversation id exists). */
+  publish(key, type, data = {}, channel = null, ref = null) {
+    if (!audSync || !key) return;
+    const event = fit({ id: randomUUID().slice(0, 12), ts: new Date().toISOString(), type, conversationId: null, channel, ref, data });
+    const listName = `events-att-${key}`;
+    enqueue(`aud:${listName}`, () => appendToList(listName, event, audSync)).catch((err) =>
+      log.warn({ type, list: listName, err: err.message }, 'Audience event publish failed')
+    );
+  },
+
   /**
    * Merge fields into an attendee's live state ("aud_live", drives the dashboard bubble).
    * Optionally records a conversation in their journey. Serialised per attendee.
